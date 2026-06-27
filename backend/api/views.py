@@ -1,60 +1,55 @@
 import json
-from django.http import StreamingHttpResponse
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
+from django.http import JsonResponse, StreamingHttpResponse
+from django.views.decorators.http import require_GET, require_POST
 
 from .models import Posting
-from .serializers import PostingSerializer, ResumeResultSerializer
 from .services import rag, chat
 
 
-class PostingsView(APIView):
-    def get(self, request):
-        postings = Posting.objects.filter(description__isnull=False).order_by("?")[:5]
-        serializer = PostingSerializer(postings, many=True)
-        return Response(serializer.data)
+@require_GET
+def postings(request):
+    qs = Posting.objects.filter(description__isnull=False).order_by("?")[:5]
+    data = list(qs.values("job_id", "company_name", "title", "description", "location"))
+    return JsonResponse(data, safe=False)
 
 
-class SearchView(APIView):
-    def post(self, request):
-        description = request.data.get("description", "").strip()
-        if not description:
-            return Response({"error": "description required"}, status=status.HTTP_400_BAD_REQUEST)
+@require_POST
+def search(request):
+    body = json.loads(request.body)
+    description = body.get("description", "").strip()
+    if not description:
+        return JsonResponse({"error": "description required"}, status=400)
 
-        results = rag.search(description, k=50)
-        serializer = ResumeResultSerializer(results, many=True)
-        return Response(serializer.data)
+    results = rag.search(description, k=50)
+    return JsonResponse(results, safe=False)
 
 
-class ChatView(APIView):
-    def post(self, request):
-        messages = request.data.get("messages", [])
-        query = request.data.get("query", "")
+@require_POST
+def chat_stream(request):
+    body = json.loads(request.body)
+    messages = body.get("messages", [])
+    query = body.get("query", "")
 
-        if not query:
-            return Response({"error": "query required"}, status=status.HTTP_400_BAD_REQUEST)
+    if not query:
+        return JsonResponse({"error": "query required"}, status=400)
 
-        if not chat.api_key_configured():
-            return Response(
-                {"error": "ANTHROPIC_API_KEY not configured"},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
+    if not chat.api_key_configured():
+        return JsonResponse({"error": "ANTHROPIC_API_KEY not configured"}, status=503)
 
-        def event_stream():
-            sources = None
-            for chunk in chat.stream_response(messages, query):
-                if isinstance(chunk, list):
-                    sources = chunk
-                else:
-                    yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+    def event_stream():
+        sources = None
+        for chunk in chat.stream_response(messages, query):
+            if isinstance(chunk, list):
+                sources = chunk
+            else:
+                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
 
-            if sources is not None:
-                yield f"data: {json.dumps({'type': 'sources', 'content': sources})}\n\n"
+        if sources is not None:
+            yield f"data: {json.dumps({'type': 'sources', 'content': sources})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-        response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
-        response["Cache-Control"] = "no-cache"
-        response["X-Accel-Buffering"] = "no"
-        return response
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
